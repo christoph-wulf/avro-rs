@@ -122,6 +122,9 @@ pub fn decode<R: Read>(schema: &Schema, reader: &mut R) -> AvroResult<Value> {
                 .map_err(|e| Error::ReadFixed(e, size))?;
             Ok(Value::Fixed(size, buf))
         }
+        Schema::Reference { name: _, ref referenced } => {
+            decode(referenced, reader)
+        }
         Schema::Array(ref inner) => {
             let mut items = Vec::new();
 

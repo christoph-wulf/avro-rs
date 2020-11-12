@@ -334,6 +334,7 @@ impl Value {
             (&Value::Fixed(n, _), &Schema::Duration) => n == 12,
             // TODO: check precision against n
             (&Value::Fixed(_n, _), &Schema::Decimal { .. }) => true,
+            (_, &Schema::Reference { ref name, ref referenced }) => Value::validate(&self, referenced),
             (&Value::String(ref s), &Schema::Enum { ref symbols, .. }) => symbols.contains(s),
             (&Value::Enum(i, ref s), &Schema::Enum { ref symbols, .. }) => symbols
                 .get(i as usize)
@@ -394,6 +395,7 @@ impl Value {
             Schema::Array(ref inner) => self.resolve_array(inner),
             Schema::Map(ref inner) => self.resolve_map(inner),
             Schema::Record { ref fields, .. } => self.resolve_record(fields),
+            Schema::Reference { name: _, ref referenced } => self.resolve(referenced),
             Schema::Decimal {
                 scale,
                 precision,

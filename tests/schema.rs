@@ -296,6 +296,73 @@ const RECORD_EXAMPLES: &[(&str, bool)] = &[
     ),
 ];
 
+const REFERENCES_EXAMPLES: &[(&str, bool)] = &[
+    (
+        r#"{
+             "type" : "record",
+             "name" : "Outer",
+             "fields" : [ {
+               "name" : "inner_definition",
+               "type" : {
+                 "type" : "record",
+                 "name" : "Inner",
+                 "fields" : [ {
+                   "name" : "str",
+                   "type" : "string"
+                 } ]
+               }
+             }, {
+               "name" : "inner_reference",
+               "type" : "Inner"
+             } ]
+           }"#,
+        true,
+    ),
+    (
+        r#"{
+             "type" : "record",
+             "name" : "Outer",
+             "fields" : [ {
+               "name" : "inner_reference",
+               "type" : "Inner"
+             }, {
+               "name" : "inner_definition",
+               "type" : {
+                 "type" : "record",
+                 "name" : "Inner",
+                 "fields" : [ {
+                   "name" : "str",
+                   "type" : "string"
+                 } ]
+               }
+             } ]
+           }"#,
+        false,
+    ),
+    (
+        r#"{
+             "type" : "record",
+             "name" : "Outer",
+             "fields" : [ {
+               "name" : "inner_definition",
+               "type" : {
+                 "type" : "record",
+                 "name" : "Inner",
+                 "namespace" : "qualifier",
+                 "fields" : [ {
+                   "name" : "str",
+                   "type" : "string"
+                 } ]
+               }
+             }, {
+               "name" : "inner_reference",
+               "type" : "qualifier.Inner"
+             } ]
+           }"#,
+        true,
+    ),
+];
+
 const DOC_EXAMPLES: &[(&str, bool)] = &[
     (
         r#"{
@@ -523,6 +590,7 @@ lazy_static! {
         .chain(MAP_EXAMPLES.iter().copied())
         .chain(UNION_EXAMPLES.iter().copied())
         .chain(RECORD_EXAMPLES.iter().copied())
+        .chain(REFERENCES_EXAMPLES.iter().copied())
         .chain(DOC_EXAMPLES.iter().copied())
         .chain(OTHER_ATTRIBUTES_EXAMPLES.iter().copied())
         .chain(DECIMAL_LOGICAL_TYPE.iter().copied())

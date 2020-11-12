@@ -120,11 +120,13 @@ pub fn encode_ref(value: &Value, schema: &Schema, buffer: &mut Vec<u8>) {
             if let Schema::Record {
                 fields: ref schema_fields,
                 ..
-            } = *schema
+            } = *schema.resolved()
             {
                 for (i, &(_, ref value)) in fields.iter().enumerate() {
                     encode_ref(value, &schema_fields[i].schema, buffer);
                 }
+            } else {
+                panic!("Not a record: {:?}", schema)
             }
         }
     }

@@ -8,6 +8,8 @@ use serde::{
 use serde_json::{Map, Value};
 use std::{borrow::Cow, collections::HashMap, convert::TryInto, fmt, str::FromStr};
 use strum_macros::{EnumDiscriminants, EnumString};
+use std::ffi::CString;
+use std::borrow::Borrow;
 
 /// Represents an Avro schema fingerprint
 /// More information about Avro schema fingerprints can be found in the
@@ -81,6 +83,11 @@ pub enum Schema {
     },
     /// A `fixed` Avro schema.
     Fixed { name: Name, size: usize },
+    /// A referenced Avro schema (previously defined in the JSON).
+    Reference {
+        name: String,
+        referenced: Box<Schema>,
+    },
     /// Logical type which represents `Decimal` values. The underlying type is serialized and
     /// deserialized as `Schema::Bytes` or `Schema::Fixed`.
     ///
@@ -275,11 +282,11 @@ pub enum RecordFieldOrder {
 
 impl RecordField {
     /// Parse a `serde_json::Value` into a `RecordField`.
-    fn parse(field: &Map<String, Value>, position: usize) -> AvroResult<Self> {
+    fn parse(field: &Map<String, Value>, position: usize, known_types: &mut KnownTypes) -> AvroResult<Self> {
         let name = field.name().ok_or_else(|| Error::GetNameFieldFromRecord)?;
 
         // TODO: "type" = "<record name>"
-        let schema = Schema::parse_complex(field)?;
+        let schema = Schema::parse_complex(field, known_types)?;
 
         let default = field.get("default").cloned();
 
@@ -317,7 +324,16 @@ impl UnionSchema {
             if let Schema::Union(_) = schema {
                 return Err(Error::GetNestedUnion);
             }
-            let kind = SchemaKind::from(schema);
+
+            let kind: SchemaKind =
+                match schema {
+                    Schema::Reference { name: _, referenced } => {
+                        let schema: &Schema = referenced.borrow();
+                        SchemaKind::from(schema)
+                    }
+                    other => SchemaKind::from(other),
+                };
+
             if vindex.insert(kind, i).is_some() {
                 return Err(Error::GetUnionDuplicate);
             }
@@ -378,6 +394,10 @@ fn parse_json_integer_for_decimal(value: &serde_json::Number) -> Result<DecimalM
     })
 }
 
+/// Models already visited type definitions in the depth-first, left-to-right traversal of the JSON
+/// parse tree according to the AVRO specification for names.
+type KnownTypes = HashMap<String, Schema>;
+
 impl Schema {
     /// Create a `Schema` from a string representing a JSON Avro schema.
     pub fn parse_str(input: &str) -> Result<Self, Error> {
@@ -389,13 +409,34 @@ impl Schema {
     /// Create a `Schema` from a `serde_json::Value` representing a JSON Avro
     /// schema.
     pub fn parse(value: &Value) -> AvroResult<Self> {
+        let mut known_types = HashMap::new();
+        Self::parse_subschema(value, &mut known_types)
+    }
+
+    /// Registers a schema by its short and full name.
+    fn register(name: Name, schema: Schema, known_types: &mut KnownTypes) {
+        known_types.insert(name.fullname(None), schema.clone());
+        known_types.insert(name.name, schema);
+    }
+
+    pub fn resolved(&self) -> &Self {
+        match *self {
+            Schema::Reference { ref name, ref referenced } => referenced,
+            _ => &self
+        }
+    }
+
+    /// Create a (sub) `Schema` from a `serde_json::Value` representing a JSON Avro schema.
+    /// Resolves types referenced by their names.
+    fn parse_subschema(value: &Value, known_types: &mut KnownTypes) -> AvroResult<Self> {
         match *value {
-            Value::String(ref t) => Schema::parse_primitive(t.as_str()),
-            Value::Object(ref data) => Schema::parse_complex(data),
-            Value::Array(ref data) => Schema::parse_union(data),
+            Value::String(ref t) => Schema::parse_reference(t.as_str(), known_types),
+            Value::Object(ref data) => Schema::parse_complex(data, known_types),
+            Value::Array(ref data) => Schema::parse_union(data, known_types),
             _ => Err(Error::ParseSchemaFromValidJson),
         }
     }
+
 
     /// Converts `self` into its [Parsing Canonical Form].
     ///
@@ -421,7 +462,16 @@ impl Schema {
         }
     }
 
-    /// Parse a `serde_json::Value` representing a primitive Avro type into a
+    /// Parse a string value representing a reference or primitive Avro type into a
+    /// `Schema`.
+    fn parse_reference(reference: &str, known_types: &KnownTypes) -> AvroResult<Self> {
+        match known_types.get(reference) {
+            Some(known_type) => Ok(Schema::Reference { name: reference.to_string(), referenced: Box::new(known_type.clone()) }),
+            None => Schema::parse_primitive(reference)
+        }
+    }
+
+    /// Parse a string value representing a primitive Avro type into a
     /// `Schema`.
     fn parse_primitive(primitive: &str) -> AvroResult<Self> {
         match primitive {
@@ -463,7 +513,7 @@ impl Schema {
     ///
     /// Avro supports "recursive" definition of types.
     /// e.g: {"type": {"type": "string"}}
-    fn parse_complex(complex: &Map<String, Value>) -> AvroResult<Self> {
+    fn parse_complex(complex: &Map<String, Value>, known_types: &mut KnownTypes) -> AvroResult<Self> {
         fn logical_verify_type(
             complex: &Map<String, Value>,
             kinds: &[SchemaKind],
@@ -539,15 +589,15 @@ impl Schema {
         }
         match complex.get("type") {
             Some(&Value::String(ref t)) => match t.as_str() {
-                "record" => Schema::parse_record(complex),
-                "enum" => Schema::parse_enum(complex),
-                "array" => Schema::parse_array(complex),
-                "map" => Schema::parse_map(complex),
-                "fixed" => Schema::parse_fixed(complex),
-                other => Schema::parse_primitive(other),
+                "record" => Schema::parse_record(complex, known_types),
+                "enum" => Schema::parse_enum(complex, known_types),
+                "array" => Schema::parse_array(complex, known_types),
+                "map" => Schema::parse_map(complex, known_types),
+                "fixed" => Schema::parse_fixed(complex, known_types),
+                other => Schema::parse_reference(other, known_types),
             },
-            Some(&Value::Object(ref data)) => Schema::parse_complex(data),
-            Some(&Value::Array(ref variants)) => Schema::parse_union(variants),
+            Some(&Value::Object(ref data)) => Schema::parse_complex(data, known_types),
+            Some(&Value::Array(ref variants)) => Schema::parse_union(variants, known_types),
             Some(unknown) => Err(Error::GetComplexType(unknown.clone())),
             None => Err(Error::GetComplexTypeField),
         }
@@ -555,7 +605,7 @@ impl Schema {
 
     /// Parse a `serde_json::Value` representing a Avro record type into a
     /// `Schema`.
-    fn parse_record(complex: &Map<String, Value>) -> AvroResult<Self> {
+    fn parse_record(complex: &Map<String, Value>, known_types: &mut KnownTypes) -> AvroResult<Self> {
         let name = Name::parse(complex)?;
 
         let mut lookup = HashMap::new();
@@ -569,7 +619,7 @@ impl Schema {
                     .iter()
                     .filter_map(|field| field.as_object())
                     .enumerate()
-                    .map(|(position, field)| RecordField::parse(field, position))
+                    .map(|(position, field)| RecordField::parse(field, position, known_types))
                     .collect::<Result<_, _>>()
             })?;
 
@@ -577,17 +627,15 @@ impl Schema {
             lookup.insert(field.name.clone(), field.position);
         }
 
-        Ok(Schema::Record {
-            name,
-            doc: complex.doc(),
-            fields,
-            lookup,
-        })
+        let registered_name = name.clone();
+        let schema = Schema::Record { name, doc: complex.doc(), fields, lookup };
+        Schema::register(registered_name, schema.clone(), known_types);
+        Ok(schema)
     }
 
     /// Parse a `serde_json::Value` representing a Avro enum type into a
     /// `Schema`.
-    fn parse_enum(complex: &Map<String, Value>) -> AvroResult<Self> {
+    fn parse_enum(complex: &Map<String, Value>, known_types: &mut KnownTypes) -> AvroResult<Self> {
         let name = Name::parse(complex)?;
 
         let symbols = complex
@@ -602,46 +650,45 @@ impl Schema {
                     .ok_or_else(|| Error::GetEnumSymbols)
             })?;
 
-        Ok(Schema::Enum {
-            name,
-            doc: complex.doc(),
-            symbols,
-        })
+        let registered_name = name.clone();
+        let schema = Schema::Enum { name, doc: complex.doc(), symbols };
+        Schema::register(registered_name, schema.clone(), known_types);
+        Ok(schema)
     }
 
     /// Parse a `serde_json::Value` representing a Avro array type into a
     /// `Schema`.
-    fn parse_array(complex: &Map<String, Value>) -> AvroResult<Self> {
+    fn parse_array(complex: &Map<String, Value>, known_types: &mut KnownTypes) -> AvroResult<Self> {
         complex
             .get("items")
             .ok_or_else(|| Error::GetArrayItemsField)
-            .and_then(|items| Schema::parse(items))
+            .and_then(|items| Schema::parse_subschema(items, known_types))
             .map(|schema| Schema::Array(Box::new(schema)))
     }
 
     /// Parse a `serde_json::Value` representing a Avro map type into a
     /// `Schema`.
-    fn parse_map(complex: &Map<String, Value>) -> AvroResult<Self> {
+    fn parse_map(complex: &Map<String, Value>, known_types: &mut KnownTypes) -> AvroResult<Self> {
         complex
             .get("values")
             .ok_or_else(|| Error::GetMapValuesField)
-            .and_then(|items| Schema::parse(items))
+            .and_then(|items| Schema::parse_subschema(items, known_types))
             .map(|schema| Schema::Map(Box::new(schema)))
     }
 
     /// Parse a `serde_json::Value` representing a Avro union type into a
     /// `Schema`.
-    fn parse_union(items: &[Value]) -> AvroResult<Self> {
+    fn parse_union(items: &[Value], known_types: &mut KnownTypes) -> AvroResult<Self> {
         items
             .iter()
-            .map(Schema::parse)
+            .map(|v| Schema::parse_subschema(v, known_types))
             .collect::<Result<Vec<_>, _>>()
             .and_then(|schemas| Ok(Schema::Union(UnionSchema::new(schemas)?)))
     }
 
     /// Parse a `serde_json::Value` representing a Avro fixed type into a
     /// `Schema`.
-    fn parse_fixed(complex: &Map<String, Value>) -> AvroResult<Self> {
+    fn parse_fixed(complex: &Map<String, Value>, known_types: &mut KnownTypes) -> AvroResult<Self> {
         let name = Name::parse(complex)?;
 
         let size = complex
@@ -649,17 +696,17 @@ impl Schema {
             .and_then(|v| v.as_i64())
             .ok_or_else(|| Error::GetFixedSizeField)?;
 
-        Ok(Schema::Fixed {
-            name,
-            size: size as usize,
-        })
+        let registered_name = name.clone();
+        let schema = Schema::Fixed { name, size: size as usize };
+        Schema::register(registered_name, schema.clone(), known_types);
+        Ok(schema)
     }
 }
 
 impl Serialize for Schema {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
+        where
+            S: Serializer,
     {
         match *self {
             Schema::Null => serializer.serialize_str("null"),
@@ -729,6 +776,7 @@ impl Serialize for Schema {
                 map.serialize_entry("size", size)?;
                 map.end()
             }
+            Schema::Reference { ref name, .. } => serializer.serialize_str(name),
             Schema::Decimal {
                 ref scale,
                 ref precision,
@@ -796,8 +844,8 @@ impl Serialize for Schema {
 
 impl Serialize for RecordField {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
+        where
+            S: Serializer,
     {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("name", &self.name)?;
@@ -1012,7 +1060,7 @@ mod tests {
             }
         "#,
         )
-        .unwrap();
+            .unwrap();
 
         let mut lookup = HashMap::new();
         lookup.insert("a".to_owned(), 0);
@@ -1173,7 +1221,7 @@ mod tests {
         let schema = Schema::parse_str(
             r#"{"type": ["null", {"type": "long", "logicalType": "timestamp-micros"}]}"#,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(
             schema,
             Schema::Union(UnionSchema::new(vec![Schema::Null, Schema::TimestampMicros]).unwrap())
